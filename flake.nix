@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-26.05";
     nixpkgs-unstable.url = "github:nixos/nixpkgs/nixos-unstable";
   };
 
@@ -11,24 +11,7 @@
       unstable = import nixpkgs-unstable {
         inherit system;
         config.allowUnfree = true;
-      };
-      stackablectl = { stdenv, lib, pkgs, autoPatchelfHook }: stdenv.mkDerivation rec {
-        pname = "stackablectl";
-        version = "1.2.2";
-        src = pkgs.fetchurl {
-          url = "https://github.com/stackabletech/stackable-cockpit/releases/download/stackablectl-1.2.2/stackablectl-x86_64-unknown-linux-gnu";
-          sha256 = "sha256-BZBFi7nYnzEuHfbtiGogZ2cXMfYwFsLq+vY0d/aggJw=";
-        };
-        dontUnpack = true;
-        nativeBuildInputs = [ autoPatchelfHook ];
-        buildInputs = [ stdenv.cc.cc ];
-        sourceRoot = ".";
-        installPhase = ''install -m755 -D $src $out/bin/stackablectl'';
-        meta = with lib; {
-          homepage = "https://stackable.tech";
-          description = "Stackable CLI";
-          platforms = platforms.linux;
-        };
+        overlays = [ (import ./pkgs/claude-code-overlay.nix) ];
       };
     in {
       nixosConfigurations.devVM = nixpkgs.lib.nixosSystem {
@@ -50,10 +33,73 @@
                     - "127.0.0.1"
                     - "0.0.0.0"
                     - "localhost"
+                - |
+                  kind: KubeletConfiguration
+                  failSwapOn: false
+                  featureGates:
+                    NodeSwap: true
+                  memorySwap:
+                    swapBehavior: NoSwap
                 nodes:
                 - role: control-plane
               '';
-              kindWrapped = pkgs.writeShellScriptBin "kind" ''
+
+              # Script to patch the node's reported capacity so the scheduler
+              # thinks there is 64Gi of memory (RAM + swap backing).
+              # Run once after "kind create cluster"; Ctrl-C to stop.
+              kindPatchMemory = pkgs.writeShellScriptBin "kind-patch-memory" ''
+                set -euo pipefail
+                MEM="''${1:-64Gi}"
+                NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+                echo "Patching node $NODE → $MEM (loop, Ctrl-C to stop)"
+
+                # kubelet overwrites .status every ~10s so we keep patching
+                kubectl proxy --port=8099 &
+                PROXY=$!
+                trap "kill $PROXY 2>/dev/null" EXIT
+
+                while true; do
+                  ${pkgs.curl}/bin/curl -s -X PATCH \
+                    "http://localhost:8099/api/v1/nodes/$NODE/status" \
+                    -H "Content-Type: application/strategic-merge-patch+json" \
+                    -d "{\"status\":{\"capacity\":{\"memory\":\"$MEM\"},\"allocatable\":{\"memory\":\"$MEM\"}}}" \
+                    > /dev/null
+                  sleep 8
+                done
+              '';
+              voiceInput = pkgs.writeShellScriptBin "voice-input" ''
+              set -euo pipefail
+              MODEL=''${WHISPER_MODEL:-/var/lib/whisper/ggml-base.en.bin}
+              if [ ! -f "$MODEL" ]; then
+                echo "Whisper model not found at $MODEL" >&2
+                echo "Download it with:" >&2
+                echo "  sudo mkdir -p /var/lib/whisper && sudo curl -fsSL https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin -o /var/lib/whisper/ggml-base.en.bin" >&2
+                exit 1
+              fi
+              TMPFILE=$(mktemp /tmp/voice-XXXXXX.wav)
+              trap 'rm -f "$TMPFILE" "''${TMPFILE%.wav}.txt"' EXIT
+              printf "Recording... (speak now, silence stops recording)\n" >&2
+              ${pkgs.sox}/bin/rec -q -r 16000 -c 1 -b 16 "$TMPFILE" \
+                silence 1 0.1 3% 1 2.5 3% 2>/dev/null || true
+              printf "Transcribing...\n" >&2
+              ${pkgs.whisper-cpp}/bin/whisper-cli \
+                -m "$MODEL" -f "$TMPFILE" \
+                --output-txt --output-file "''${TMPFILE%.wav}" \
+                2>/dev/null || true
+              TXTFILE=''${TMPFILE%.wav}.txt
+              if [ -f "$TXTFILE" ]; then
+                sed 's/^\s*//;s/\s*$//' "$TXTFILE" | grep -v '^\[BLANK_AUDIO\]$' | tr -d '\n'
+                printf "\n"
+              fi
+            '';
+
+            speak = pkgs.writeShellScriptBin "speak" ''
+              TEXT=''${*:-$(cat)}
+              [ -z "$TEXT" ] && exit 0
+              printf '%s\n' "$TEXT" | ${pkgs.espeak-ng}/bin/espeak-ng -v en -s 160
+            '';
+
+            kindWrapped = pkgs.writeShellScriptBin "kind" ''
                 create_cluster=false
                 has_config=false
                 case "$*" in
@@ -85,16 +131,27 @@
             environment.systemPackages = with pkgs; [
               # AI tools
               unstable.claude-code
+              unstable.opencode
+              (pkgs.callPackage ./pkgs/ccometixline.nix {})
+              (pkgs.callPackage ./pkgs/rtk.nix {})
+              (pkgs.callPackage ./pkgs/antigravity.nix {})
 
               # Kubernetes
-              (pkgs.callPackage stackablectl {})
+              (pkgs.callPackage ./pkgs/stackablectl.nix {})
               kindWrapped
+              kindPatchMemory
               kubectl
               kustomize
               kubernetes-helm
               kuttl
               kubescape
               argocd
+              tilt
+
+              # Audio
+              sox
+              alsa-utils
+              pulseaudio
 
               # Containers & registries
               docker-compose
@@ -135,8 +192,11 @@
               uv
               pre-commit
 
+              # Browsers
+              chromium
+
               # Node
-              nodejs_20
+              nodejs_22
 
               # Java
               jdk21
@@ -154,7 +214,7 @@
               tflint
               hadolint
               yamllint
-              nixfmt-rfc-style
+              nixfmt
               nixpkgs-fmt
 
               # CLI utilities
@@ -185,7 +245,7 @@
             ];
 
             networking.hostName = "devVM";
-            networking.firewall.allowedTCPPorts = [ 22 6443 3000 ];
+            networking.firewall.allowedTCPPorts = [ 22 6443 3000 3001 3002 ];
 
             # Allow internet but block host OS and local network.
             # SLIRP DNS is at 10.0.2.3, so exempt it before blocking 10.0.0.0/8.
@@ -222,7 +282,7 @@
             users.users.voeti = {
               isNormalUser = true;
               uid = 1000;
-              extraGroups = [ "docker" ];
+              extraGroups = [ "docker" "audio" "pulse-access" ];
               openssh.authorizedKeys.keys = [
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJyKfjroqIznF6O5R7OessqLHWlNy7PDF+PblxQeiAsa"
               ];
@@ -242,6 +302,8 @@
 
             environment.sessionVariables = {
               PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+              EDITOR = "vim";
+              COLORTERM = "truecolor";
             };
 
             environment.shellAliases = {
@@ -282,17 +344,30 @@
             };
             swapDevices = [{
               device = "/var/lib/swapfile";
-              size = 32 * 1024; # 32 GB in MiB
+              size = 32 * 1024; # 32 GB in MiB – backs Kubernetes swap scheduling
             }];
 
             nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
+            # Enable PulseAudio for voice input/output
+            security.rtkit.enable = true;
+            services.pulseaudio.enable = true;
+            services.pulseaudio.systemWide = true;
+            services.pulseaudio.extraConfig = ''
+              set-source-mute alsa_input.pci-0000_00_0b.0.analog-stereo 0
+              set-source-volume alsa_input.pci-0000_00_0b.0.analog-stereo 65536
+            '';
+
             services.irqbalance.enable = true;
+
+            # Periodically TRIM the fs so freed blocks are punched out of the
+            # qcow2 backing file (needs discard=unmap on the drive, see vmVariant).
+            services.fstrim.enable = true;
 
             boot.kernel.sysctl = {
               "net.ipv6.conf.all.disable_ipv6" = 1;
               "net.ipv6.conf.default.disable_ipv6" = 1;
-              "vm.swappiness" = 1;
+              "vm.swappiness" = 60;
               "vm.max_map_count" = 262144;
               "fs.inotify.max_user_watches" = 524288;
               "fs.inotify.max_user_instances" = 1024;
@@ -303,24 +378,55 @@
 
             boot.postBootCommands = ''
               mount -o remount,cache=mmap /home/voeti/stackable 2>/dev/null || true
+              mount -o remount,cache=mmap /home/voeti/projects 2>/dev/null || true
             '';
 
             system.stateVersion = "25.11";
 
             virtualisation.vmVariant = {
               virtualisation = {
-                memorySize = 16384;
+                memorySize = 12288;
                 cores = 16;
                 diskSize = 327680; # 320GB
+                writableStoreUseTmpfs = false;
+                # Override the built-in root drive to enable discard so guest
+                # TRIM/deletes shrink devVM.qcow2 instead of growing forever.
+                # detect-zeroes=unmap also punches holes on zero writes.
+                qemu.drives = lib.mkForce [{
+                  name = "root";
+                  file = ''"$NIX_DISK_IMAGE"'';
+                  driveExtraOpts = {
+                    cache = "writeback";
+                    werror = "report";
+                    discard = "unmap";
+                    detect-zeroes = "unmap";
+                  };
+                  deviceExtraOpts = {
+                    bootindex = "1";
+                    serial = "root";
+                  };
+                }];
                 qemu.networkingOptions = lib.mkForce [
-                  "-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:45631-:45631,hostfwd=tcp:127.0.0.1:33000-:3000"
+                  "-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:45631-:45631,hostfwd=tcp:127.0.0.1:33000-:3000,hostfwd=tcp:127.0.0.1:33001-:3001,hostfwd=tcp:127.0.0.1:33002-:3002"
                   "-device virtio-net-pci,netdev=net0"
                 ];
+                sharedDirectories.projects = {
+                  source = "/home/voeti/projects";
+                  target = "/home/voeti/projects";
+                  securityModel = "passthrough";
+                };
                 sharedDirectories.stackable = {
                   source = "/home/voeti/stackable";
                   target = "/home/voeti/stackable";
+                  securityModel = "passthrough";
                 };
-                qemu.options = [ "-cpu host" ];
+                qemu.options = [
+                  "-cpu host"
+                  # Audio passthrough: use PulseAudio (works on PipeWire via compat layer too)
+                  "-audiodev pa,id=audio0"
+                  "-device intel-hda"
+                  "-device hda-duplex,audiodev=audio0"
+                ];
               };
             };
           })
